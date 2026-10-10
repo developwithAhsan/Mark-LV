@@ -208,34 +208,54 @@ def configure(input_rate: int, output_rate: int) -> None:
 
 
 def _usable(idx: int, kind: str) -> bool:
-    """Can this device actually be opened at the rate we need?
+    """Check that a real stream opens, using Linux device-native rates if needed.
 
-    Deliberately opens a real stream rather than asking
-    `check_output_settings`, because that function lies: it passed for an MME
-    endpoint that then failed to open with "The specified format is not
-    supported or cannot be translated" [MME error 32]. Opening and immediately
-    closing costs milliseconds and is the only answer that holds."""
-    st = None
+    ALSA devices on ChromeOS/Linux often reject 24 kHz even though they can play
+    audio at 44.1/48 kHz. For output enumeration, try the device's native rate
+    first so PortAudio doesn't emit a noisy paInvalidSampleRate warning on every
+    startup. main.py adapts the model's 24 kHz PCM when it opens playback.
+    """
     try:
+        import platform
         import sounddevice as sd
-        rate = _RATES.get(kind, 16000)
-        if kind == "input":
-            st = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                                blocksize=1024, device=idx,
-                                callback=lambda *_a: None)
-        else:
-            st = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16",
-                                    blocksize=1024, device=idx)
-        st.start()
-        return True
-    except Exception:
-        return False
-    finally:
-        if st is not None:
+
+        requested = int(_RATES.get(kind, 16000))
+        rates = [requested]
+        if kind == "output" and platform.system() == "Linux":
             try:
-                st.stop(); st.close()
+                info = sd.query_devices(idx, "output")
+                native = int(round(float(info.get("default_samplerate", 0))))
+            except Exception:
+                native = 0
+            # Prefer native hardware rate, then common Linux rates, then the
+            # model's original rate as a final compatibility option.
+            rates = [r for r in (native, 48000, 44100, requested)
+                     if r > 0 and r not in ()]
+            rates = list(dict.fromkeys(rates))
+        for rate in rates:
+            st = None
+            try:
+                if kind == "input":
+                    st = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
+                                        blocksize=1024, device=idx,
+                                        callback=lambda *_a: None)
+                else:
+                    st = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16",
+                                            blocksize=1024, device=idx)
+                st.start()
+                return True
             except Exception:
                 pass
+            finally:
+                if st is not None:
+                    try:
+                        st.stop()
+                        st.close()
+                    except Exception:
+                        pass
+        return False
+    except Exception:
+        return False
 
 # Aliases for "the default device" and internal routing endpoints. Matched
 # case-insensitively as substrings against the device name.
