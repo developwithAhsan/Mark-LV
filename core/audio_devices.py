@@ -229,8 +229,7 @@ def _usable(idx: int, kind: str) -> bool:
                 native = 0
             # Prefer native hardware rate, then common Linux rates, then the
             # model's original rate as a final compatibility option.
-            rates = [r for r in (native, 48000, 44100, requested)
-                     if r > 0 and r not in ()]
+            rates = [r for r in (native, 48000, 44100, requested) if r > 0]
             rates = list(dict.fromkeys(rates))
         for rate in rates:
             st = None
