@@ -302,9 +302,15 @@ def _query() -> dict[str, list[str]]:
                 found = _collect(api_filter, kind)
                 if not found:
                     continue
-                # One probe per API per direction, cached, on this thread.
-                if not _transport_works(found[0][0], kind, (api_filter, kind)):
-                    continue
+                # Windows can expose output APIs that accept writes but silently
+                # discard them, so keep the transport probe there. On Linux,
+                # probing ALSA/PipeWire endpoints a second time can transiently
+                # fail with PortAudio "Device unavailable" even when _usable()
+                # has already opened the endpoint successfully. Trust the real
+                # stream-open check on Linux instead of rejecting that endpoint.
+                if platform.system() != "Linux":
+                    if not _transport_works(found[0][0], kind, (api_filter, kind)):
+                        continue
                 _chosen_api[kind] = api_filter
                 out[kind] = [_display_name(n, devices) for _i, n in found]
                 break
