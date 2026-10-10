@@ -1606,9 +1606,40 @@ class JarvisLive:
         if _spk_dev is not None:
             print(f"[JARVIS] 🔊 Output device: {_spk_name}")
 
-        def _open_spk(dev):
+        class _RateAdaptedOutput:
+            """Adapt Gemini's 24 kHz PCM to a device that only accepts its native rate."""
+            def __init__(self, raw_stream, source_rate, device_rate):
+                self._stream = raw_stream
+                self._source_rate = int(source_rate)
+                self._device_rate = int(device_rate)
+                self.latency = getattr(raw_stream, "latency", 0.0)
+
+            def write(self, data):
+                if self._source_rate == self._device_rate:
+                    return self._stream.write(data)
+                samples = np.frombuffer(data, dtype=np.int16)
+                if samples.size == 0:
+                    return self._stream.write(data)
+                out_count = max(1, round(samples.size * self._device_rate / self._source_rate))
+                # Linear interpolation avoids adding SciPy as a heavy dependency.
+                positions = np.arange(out_count, dtype=np.float64) * (
+                    self._source_rate / self._device_rate
+                )
+                positions = np.minimum(positions, samples.size - 1)
+                converted = np.interp(
+                    positions, np.arange(samples.size, dtype=np.float64), samples
+                ).astype(np.int16)
+                return self._stream.write(converted.tobytes())
+
+            def stop(self):
+                return self._stream.stop()
+
+            def close(self):
+                return self._stream.close()
+
+        def _open_spk(dev, rate=RECEIVE_SAMPLE_RATE):
             st = sd.RawOutputStream(
-                samplerate=RECEIVE_SAMPLE_RATE,
+                samplerate=rate,
                 channels=CHANNELS,
                 dtype="int16",
                 blocksize=CHUNK_SIZE,
@@ -1617,17 +1648,42 @@ class JarvisLive:
             st.start()
             return st
 
+        def _open_spk_compatible(dev):
+            # Prefer 24 kHz. Some Linux/ChromeOS ALSA endpoints only accept
+            # the hardware rate (commonly 44.1 or 48 kHz).
+            try:
+                return _open_spk(dev)
+            except Exception as original_error:
+                if _platform.system() != "Linux":
+                    raise
+                try:
+                    info = sd.query_devices(dev, "output") if dev is not None else sd.query_devices(kind="output")
+                    native_rate = int(round(float(info.get("default_samplerate", 0))))
+                except Exception:
+                    native_rate = 0
+                tried = set()
+                for rate in (native_rate, 48000, 44100):
+                    if rate <= 0 or rate == RECEIVE_SAMPLE_RATE or rate in tried:
+                        continue
+                    tried.add(rate)
+                    try:
+                        raw = _open_spk(dev, rate)
+                        print(f"[Audio] output: using {rate} Hz device rate; adapting {RECEIVE_SAMPLE_RATE} Hz voice audio")
+                        return _RateAdaptedOutput(raw, RECEIVE_SAMPLE_RATE, rate)
+                    except Exception as rate_error:
+                        print(f"[Audio] output: {rate} Hz fallback failed: {rate_error}")
+                raise original_error
+
         try:
-            stream = _open_spk(_spk_dev)
+            stream = _open_spk_compatible(_spk_dev)
         except Exception as _e:
-            # A chosen output that the host API accepts by name but refuses to
-            # open (exclusive mode, wrong sample rate, device asleep) must not
-            # cost the user their voice. Fall back to the default and say so.
+            # A chosen output can become unavailable between enumeration and
+            # playback. Fall back to the system default instead of stopping.
             if _spk_dev is None:
                 raise
             print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
             self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
-            stream = _open_spk(None)
+            stream = _open_spk_compatible(None)
 
         # Ask the device how far behind the speakers actually are, rather than
         # assuming. This is what the echo tail is sized from, so a machine with a
